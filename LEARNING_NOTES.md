@@ -189,23 +189,25 @@ save_path/Town04_Opt/MM_DD_HH_MM_SS/
 ### Q: 整体模型架构？
 
 ```
-输入：4 路 RGB 图像 + 4 路深度图 + 目标车位坐标
+输入：4 路 RGB 图像 + 相机内外参 + 目标车位坐标 + 自车运动
   ↓
-CamEncoder（EfficientNet-B4）→ 图像特征
+CamEncoder（EfficientNet-B4）→ 图像特征 + 深度分布
   ↓
 BevModel（LSS: Lift-Splat-Shoot）→ BEV 鸟瞰图特征
-  ├→ SegmentationHead → BEV 分割预测（辅助任务）
   ↓
-BevEncoder（ResNet18）→ 压缩 BEV 特征 [B, 256, 8, 8]
+拼接目标车位热力图 → [B, 65, 200, 200]
   ↓
-展平 + 拼接 motion（速度+目标点）→ [B, 66, 258]
+BevEncoder（ResNet18）→ 压缩 BEV 特征 [B, 256, 256]
   ↓
-FeatureFusion（Transformer Encoder, 4层）→ [B, 66, 258]
+FeatureFusion 拼接 ego motion → Transformer Encoder, 4层 → [B, 256, 258]
+  ├→ SegmentationHead → BEV 分割预测 [B, 3, 200, 200]（辅助任务）
   ↓
 ControlPredict（Transformer Decoder, 4层）→ [B, 14, 204]
   ↓
 输出：14 个位置各 204 类的 logits → argmax 得到 token → detokenize 得到控制量
 ```
+
+注意：4 路深度图是训练深度辅助任务的真值，不是 `ParkingModel` 的直接输入。
 
 ### Q: Transformer Decoder 的输入输出形状？
 
@@ -219,12 +221,38 @@ ControlPredict（Transformer Decoder, 4层）→ [B, 14, 204]
 
 为什么输出是 14 而不是 15？因为 **Teacher Forcing**：用前 14 个 token 预测后 14 个 token（即位置 1~14），第 15 个（PAD）不需要预测。
 
-### Q: FeatureFusion 的输入 66 是怎么来的？
+### Q: FeatureFusion 的输入 `[B, 256, 258]` 是怎么来的？
 
-BEV 特征 `[B, 256, 8, 8]` → 展平 → `[B, 64, 258]`（256 通道，加 2 维 motion = 258）
-加上 `target_point`（2 维坐标，扩展为 258 维）→ `[B, 64+2, 258]` = `[B, 66, 258]`
+BevEncoder 输出：
 
-> 注：实际是 64 个空间位置 + 2 个目标点 token = 66 个 token
+```python
+bev_down_sample: [B, 256, 256]
+```
+
+这里第一个 256 是 ResNet18 layer3 的通道数，第二个 256 是 `16×16` 个 BEV 空间位置。
+
+进入 `FeatureFusion` 后先转置：
+
+```python
+[B, C=256, S=256] -> [B, S=256, C=256]
+```
+
+`ego_motion = [speed, acc_x, acc_y]` 经过 MLP 后变成 2 个附加特征维度：
+
+```python
+ego_motion:     [B, 1, 3]
+motion_feature: [B, 256, 2]
+```
+
+最后在特征维拼接：
+
+```python
+BEV token 特征: [B, 256, 256]
+motion 特征:    [B, 256, 2]
+拼接后:         [B, 256, 258]
+```
+
+所以这里没有 66 个 token，也没有把 `target_point` 当作 token 输入 Transformer。目标车位坐标在进入 BevEncoder 前已经被画成了 1 通道热力图，与 64 通道 BEV 特征拼成 `[B, 65, 200, 200]`。
 
 ---
 
@@ -472,7 +500,20 @@ ego_motion 是自车当前的运动状态，包含 3 个物理量：
 输出: [B, 1, 256]       ← 256 维特征
 ```
 
-总参数量：3×64 + 64×128 + 128×256 = 192 + 8192 + 32768 = **41,152**（加偏置 = 41,600）。
+`motion_encoder` 这一小段的参数量：
+
+```text
+只算 weight:
+3×64 + 64×128 + 128×256
+= 192 + 8192 + 32768
+= 41,152
+
+加上 bias:
+64 + 128 + 256 = 448
+41,152 + 448 = 41,600
+```
+
+注意：这里的 **41,600** 只是 `FeatureFusion.motion_encoder` 这个小 MLP 的参数量，不是整个模型的总参数量。整个 `ParkingModel` 约 **28M parameters**。
 
 ### Q: 为什么需要 ReLU（非线性激活）？
 
@@ -482,13 +523,13 @@ $$W_3 \cdot (W_2 \cdot (W_1 \cdot x)) = (W_3 W_2 W_1) \cdot x = W_{equiv} \cdot 
 
 三层线性变换等价于一层！加了 ReLU 后，每层之间引入非线性"折叠"，使得网络能学到**复杂的非线性映射**，而非简单的矩阵乘法。
 
-### Q: 为什么 motion 特征要复制 2 份？
+### Q: 为什么 motion 特征要扩展成 2 个维度？
 
-代码中 motion 经过 MLP 后被 `expand(-1, -1, 2)` 复制为 2 个 token：
+代码中 motion 经过 MLP 后被 `expand(-1, -1, 2)` 扩展为每个 BEV token 的 2 个附加特征维度：
 
 ```python
-motion_feature = self.motion_encoder(ego_motion)   # [B, 256, 1]
-motion_feature = motion_feature.transpose(1,2).expand(-1, -1, 2)  # [B, 256, 2]
+motion_feature = self.motion_encoder(ego_motion)                  # [B, 1, 256]
+motion_feature = motion_feature.transpose(1, 2).expand(-1, -1, 2) # [B, 256, 2]
 fuse_feature = torch.cat([bev_feature, motion_feature], dim=2)     # [B, 256, 258]
 ```
 
@@ -501,11 +542,12 @@ $$d_{model} \mod n_{head} = 0$$
 本项目配置：
 - BEV token 数量 = 256
 - nhead = 6
-- d_model = 序列长度 = 256 + motion_tokens
+- BEV 每个 token 原本是 256 维特征
+- d_model = 256 + 额外 motion 特征维度数
 
-需要 $(256 + n) \mod 6 = 0$，可选值：
+需要让 $(256 + n) \mod 6 = 0$，可选值：
 
-| motion tokens (n) | d_model = 256+n | 能否被 6 整除 |
+| motion 额外维度数 n | d_model = 256+n | 能否被 6 整除 |
 |---|---|---|
 | 0 | 256 | 256/6 = 42.67 ❌ |
 | 1 | 257 | 257/6 = 42.83 ❌ |
@@ -513,13 +555,13 @@ $$d_{model} \mod n_{head} = 0$$
 | 3 | 259 | 259/6 = 43.17 ❌ |
 | 4 | 260 | 260/6 = 43.33 ❌ |
 
-**2 是满足整除条件的最小值**。同时 2 个 motion token 在 258 个 token 中占比仅 0.8%，不会喧宾夺主。
+**2 是满足整除条件的最小值**。所以最终每个 BEV token 从 256 维变成 258 维，其中最后 2 维携带自车运动信息。
 
-### Q: 两个相同的 motion token 进入 Transformer 后不会冗余吗？
+### Q: 两个相同的 motion 特征维度不会冗余吗？
 
-不会。虽然初始值相同，但它们被加上**不同的位置编码**（`pos_embed` 的第 257、258 位），Transformer 能区分它们。经过多层自注意力后，两个 token 会逐渐分化，学到不同的表示。
+这里不是 2 个 motion token，而是每个空间 token 末尾的 2 个特征维度。虽然 `expand` 后这两个维度初始数值相同，但它们位于特征向量的不同维度上，后续的 Q/K/V 线性投影会给不同维度使用不同权重；再加上 `pos_embed` 也在每个特征维度上都有独立参数，因此 Transformer 可以学习到不同的使用方式。
 
-这类似 BERT 的 `[CLS]` token：初始值不重要，关键是位置编码赋予了身份，训练中学到有意义的内容。
+可以把它理解为：作者用 2 个额外 feature slot 把运动状态塞进每个 BEV 空间 token 中，而不是在序列尾部追加新的 token。
 
 ---
 

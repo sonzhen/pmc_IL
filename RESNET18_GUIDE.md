@@ -295,7 +295,7 @@ Bottleneck 通过 1×1 卷积先降维再升维，减少 3×3 卷积的计算量
 
 ### 7.1 BevEncoder：BEV 特征压缩
 
-BevEncoder **借用** ResNet18 的前 3 个 stage（不用 layer4 和分类头）：
+BevEncoder 的前向传播实际只用 ResNet18 的前 3 个 stage（不用 layer4 和分类头）。注意当前代码里 `layer4` 也被注册到了模块中，但 `forward()` 没有调用它：
 
 ```python
 class BevEncoder(nn.Module):
@@ -310,16 +310,17 @@ class BevEncoder(nn.Module):
         self.relu = trunk.relu
         self.max_pool = trunk.maxpool
 
-        # 复用前 3 个 layer（不用 layer4）
+        # 复用 ResNet18 的 layer
         self.layer1 = trunk.layer1   # 64 → 64
         self.layer2 = trunk.layer2   # 64 → 128
         self.layer3 = trunk.layer3   # 128 → 256
-        # self.layer4 = trunk.layer4   ← 不用！256 → 512 太压缩了
+        self.layer4 = trunk.layer4   # 已注册，但 forward 里没有使用
 ```
 
 **为什么不用 layer4？**
 - layer4 输出 [512, 8, 8]，flatten 后只有 64 个 token，空间信息损失太大
 - layer3 输出 [256, 16, 16]，flatten 后 256 个 token，保留更多空间细节
+- 因为 `layer4` 被注册但未参与前向，checkpoint/state_dict 会包含它的参数；但实际计算图停在 `layer3`
 
 **逐层维度变化**（以 BEV 输入为例）：
 
@@ -451,4 +452,4 @@ ResNet 至今仍是计算机视觉的**默认骨干网络**之一，大量项目
 | BN 参数 | ~9,600 | 各层 γ, β |
 | **总计** | **~11.7M** | |
 
-> 本项目 BevEncoder 不用 layer4 和 fc，实际参数约 **2.8M**（conv1 改为 65→64 后略有变化）。
+> 本项目 BevEncoder 的前向计算不用 layer4 和 fc。若只数实际参与前向的部分，约 **2.98M** 参数；但当前代码注册了 `layer4`，所以 `state_dict`/checkpoint 中的 BevEncoder 约 **11.37M** 参数。

@@ -1,6 +1,0 @@
---2026-03-13 14:56:47--  https://download.pytorch.org/whl/torchaudio-0.13.1-cp38-cp38-linux_x86_64.whl
-Resolving proxy-fdc2.con-05.emea.dc.corpintra.net (proxy-fdc2.con-05.emea.dc.corpintra.net)... 53.136.237.140
-Connecting to proxy-fdc2.con-05.emea.dc.corpintra.net (proxy-fdc2.con-05.emea.dc.corpintra.net)|53.136.237.140|:3128... connected.
-Proxy request sent, awaiting response... 403 Forbidden
-2026-03-13 14:56:48 ERROR 403: Forbidden.
-
